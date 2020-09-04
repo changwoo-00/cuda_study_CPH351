@@ -9,6 +9,7 @@ This is an exmple code used in the CUDA Lecture 2 (Quick Lab. 9-2) <br>
 #include <chrono>
 typedef std::chrono::high_resolution_clock Clock;
 //#include <DS_timer.h>
+#include <time.h>
 
 #include <omp.h>
 #include <stdio.h>
@@ -83,10 +84,55 @@ __global__ void matMul_kernel_xRow(float* _A, float* _B, float* _C)
 
 #endif
 
+#ifdef USE_SHARED_VER
+__global__ void matMul_kernel_shared(float* _A, float* _B, float* _C)
+{
+	int row = threadIdx.y;
+	int col = threadIdx.x;
+	int index = row * blockDim.x + col;
+
+	__shared__ float sA[ROW_SIZE][K_SIZE];	// 32 * 256 * 4 bytes = 16 KB
+	__shared__ float sB[K_SIZE][COL_SIZE];	// 16 KB
+
+	int offset = 0;
+
+	// load A
+	int numSubMatA = ceil((float)K_SIZE / COL_SIZE);
+	for (int i = 0; i < numSubMatA; i++) {
+		if (col + offset >= K_SIZE) break;
+
+		sA[row][col + offset] = _A[row * K_SIZE + (col + offset)];
+		offset += COL_SIZE;
+	}
+
+	// load B
+	offset = 0;
+	int numSubMatB = ceil((float)K_SIZE / ROW_SIZE);
+	for (int i = 0; i < numSubMatB; i++) {
+		if (row + offset >= K_SIZE) break;
+
+		sB[row + offset][col] = _B[col + (row + offset) * COL_SIZE];
+		offset += ROW_SIZE;
+	}
+
+	__syncthreads(); // wait until all thread load the matrix
+
+	_C[index] = 0;
+	for (int k = 0; k < K_SIZE; k++)
+		for (int i = 0; i < WORK_LOAD; i++)
+			_C[index] += sA[row][k] * sB[k][col];
+}
+#endif
 
 void main(void)
 {
 	//timer = NULL;	setTimer();
+	clock_t start_host, end_host;
+	clock_t start_htod, end_htod;
+	clock_t start_dtoh, end_dtoh;
+	clock_t start_kernel, end_kernel;
+	clock_t start_shared, end_shared;
+	double result_host, result_dtoh, result_htod, result_kernel, result_shared;
 
 	float *dA, *dB, *dC;
 	dA = dB = dC = NULL;
@@ -104,6 +150,7 @@ void main(void)
 
 	// Host code
 	//timer->onTimer(TIMER_HOST);
+	start_host = clock();
 	//#pragma omp parallel for num_threads(NUM_CPU_THREADS)
 	for (int r = 0; r < ROW_SIZE; r++)
 		for (int c = 0; c < COL_SIZE; c++)
@@ -111,19 +158,22 @@ void main(void)
 				for (int i = 0; i < WORK_LOAD; i++)
 					hostC[r][c] += A[r][k] * B[k][c];
 	//timer->offTimer(TIMER_HOST);
+	end_host = clock();
 
 	// Copy input matrices : H -> D
 	//timer->onTimer(TIMER_HtoD);
+	start_htod = clock();
 	cudaMemcpy(dA, A, sizeof(float)*MAT_SIZE_A, cudaMemcpyHostToDevice);
 	cudaMemcpy(dB, B, sizeof(float)*MAT_SIZE_B, cudaMemcpyHostToDevice);
 	//timer->offTimer(TIMER_HtoD);
+	end_htod = clock();
 
 	dim3 blockDim(COL_SIZE, ROW_SIZE);
 
 #ifdef USE_BASE_KERNEL
 	//// Kernel call
 	//timer->onTimer(TIMER_KERNEL);
-
+	start_kernel = clock();
 	matMul_kernel << <1, blockDim >> > (dA, dB, dC);
 	cudaDeviceSynchronize();
 
@@ -134,14 +184,22 @@ void main(void)
 	//cudaDeviceSynchronize();
 
 	//timer->offTimer(TIMER_KERNEL);
+	end_kernel = clock();
 #endif
 
+#ifdef USE_SHARED_VER
+	start_shared = clock();
+	matMul_kernel_shared << <1, blockDim >> > (dA, dB, dC);
+	cudaDeviceSynchronize();
+	end_shared = clock();
+#endif
 
 	// Get back result : D -> H
 	//timer->onTimer(TIMER_DtoH);
+	start_dtoh = clock();
 	cudaMemcpy(deviceC, dC, sizeof(float)*MAT_SIZE_C, cudaMemcpyDeviceToHost);
 	//timer->onTimer(TIMER_DtoH);
-
+	end_dtoh = clock();
 	// check the results
 	bool isCorrect = true;
 
@@ -162,6 +220,18 @@ void main(void)
 	//timer->printTimer();
 	//if (timer != NULL)
 	//	delete timer;
+	result_host = (double)(end_host - start_host);
+	result_htod = (double)(end_htod - start_htod);
+	result_dtoh = (double)(end_dtoh - start_dtoh);
+	result_kernel = (double)(end_kernel - start_kernel);
+	result_shared = (double)(end_shared - start_shared);
+	printf("host time : %f\n", result_host);
+	printf("H to D time : %f\n", result_htod);
+	printf("D to H time : %f\n", result_dtoh);
+	printf("kernel time : %f\n", result_kernel);
+	printf("shared time : %f\n", result_shared);
+	
+
 }
 
 void genInputMatrices(void)
